@@ -16,7 +16,8 @@
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { findImages, type ImageRef } from "../protocols/openai-responses/images.ts";
+import { findImages, partDigest, type ImageRef } from "../protocols/openai-responses/images.ts";
+import { imageDigest, type ImageDigest } from "../../core/images.ts";
 import { addNotes, type Notes } from "../../core/notes.ts";
 import { pixelHashOfData } from "../../core/pixels.ts";
 import type { FetchedCopy, IndexedImage as SessionImage, SessionIndex } from "../../core/session.ts";
@@ -26,11 +27,19 @@ type Json = Record<string, any>;
 // sits in its item (ImageRef).
 export type IndexedImage = ImageRef & SessionImage;
 export type ThreadIndex = SessionIndex<IndexedImage>;
-export type Parsed = { offset: number; type: string; payload: Json; timestamp: string | null };
-type FileCache = { size: number; mtimeMs: number; parsedTo: number; records: Parsed[] };
+export type Parsed = { offset: number; type: string; payload: Json; timestamp: string | null; compactionKeys?: string[] };
+type FileCache = { ino: number; size: number; mtimeMs: number; parsedTo: number; bytes: number; records: Parsed[] };
 
 const SEGMENT_NAME = /^rollout-[0-9T:-]+-([0-9a-f-]{36})(?:_([0-9a-f-]{36}))?\.jsonl(?:\.zst)?$/;
 const files = new Map<string, FileCache>();
+const CACHE_BYTES = 384 * 1024 * 1024;
+const CACHE_FILES = 64;
+const READ_BYTES = 4 * 1024 * 1024;
+let cachedBytes = 0;
+
+type ImageLocation = { file: string; offset: number; length: number };
+type IndexedBytes = { location: ImageLocation; digest: ImageDigest; pixelHash: string | null };
+const imageLocations = new WeakMap<object, IndexedBytes>();
 
 function walk(directory: string): string[] {
   let entries;
@@ -41,17 +50,87 @@ function walk(directory: string): string[] {
   });
 }
 
-function parseLines(buffer: Buffer, base: number, cache: FileCache): number {
-  let start = 0;
-  for (let end = buffer.indexOf(0x0a); end >= 0; end = buffer.indexOf(0x0a, start)) {
-    const text = buffer.toString("utf8", start, end).replace(/\r$/, "");
-    // A damaged line is skipped rather than failing the whole index; unknown images are sent unchanged anyway.
-    let record: Json | null = null;
-    if (text.trim()) { try { record = JSON.parse(text); } catch { record = null; } }
-    if (record) cache.records.push({ offset: base + start, type: record.type, payload: record.payload ?? {}, timestamp: typeof record.timestamp === "string" ? record.timestamp : null });
-    start = end + 1;
+function keepImage(owner: Json, value: string, digest: ImageDigest, location: ImageLocation): void {
+  imageLocations.set(owner, { location, digest, pixelHash: pixelHashOfData(digest, value) });
+}
+
+// Keep image metadata and the source range. Fetching or restoring an image reads its bytes from the rollout.
+function indexImages(item: Json, location: ImageLocation): void {
+  if (item.type === "image_generation_call" && typeof item.result === "string" && item.result) {
+    keepImage(item, item.result, imageDigest(item, item.result, "image/png"), location);
+    delete item.result;
   }
-  return start;
+  const parts = item.type === "message" ? item.content : item.output;
+  if (!Array.isArray(parts)) return;
+  for (const part of parts) {
+    const digest = partDigest(part);
+    if (digest?.mime && typeof part.image_url === "string") {
+      keepImage(part, part.image_url.slice(part.image_url.indexOf(",") + 1), digest, location);
+      delete part.image_url;
+    }
+  }
+}
+
+const INDEXED_ITEMS = new Set(["message", "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output", "image_generation_call"]);
+const INDEXED_EVENTS = new Set(["task_started", "turn_aborted", "user_message"]);
+
+function parseLine(line: Buffer, file: string, offset: number, cache: FileCache): void {
+  let record: Json;
+  try { record = JSON.parse(line.toString("utf8")); } catch { return; }
+  if (!record || typeof record !== "object") return;
+  const payload = record.payload ?? {};
+  const parsed: Parsed = { offset, type: record.type, payload, timestamp: typeof record.timestamp === "string" ? record.timestamp : null };
+  if (record.type === "response_item") {
+    if (INDEXED_ITEMS.has(payload.type)) {
+      indexImages(payload, { file, offset, length: line.length });
+      // The image index and panel search only use structured tool outputs.
+      if (typeof payload.output === "string") delete payload.output;
+    } else {
+      // Keep its position so compaction boundaries and image item indexes do not change.
+      parsed.payload = { type: payload.type };
+    }
+  } else if (record.type === "compacted" && Array.isArray(payload.replacement_history)) {
+    parsed.compactionKeys = findImages(payload.replacement_history).map((ref) => ref.key);
+    parsed.payload = {};
+  } else if (record.type === "event_msg") {
+    if (!INDEXED_EVENTS.has(payload.type)) return;
+    parsed.payload = { type: payload.type, turn_id: payload.turn_id, message: payload.message };
+  } else if (record.type !== "session_meta") {
+    return;
+  }
+  cache.records.push(parsed);
+  // Count retained text and metadata, with an allowance for object overhead.
+  cache.bytes += 256 + 2 * JSON.stringify(parsed).length;
+}
+
+// Only an unfinished line crosses chunk boundaries. Its offset stays uncommitted until the newline arrives.
+function parseChunks(chunks: Iterable<Buffer>, file: string, cache: FileCache): void {
+  let parts: Buffer[] = [];
+  for (const chunk of chunks) {
+    let start = 0;
+    for (let end = chunk.indexOf(0x0a); end >= 0; end = chunk.indexOf(0x0a, start)) {
+      const tail = chunk.subarray(start, end);
+      const line = parts.length ? Buffer.concat([...parts, tail]) : tail;
+      parseLine(line, file, cache.parsedTo, cache);
+      cache.parsedTo += line.length + 1;
+      parts = [];
+      start = end + 1;
+    }
+    if (start < chunk.length) parts.push(chunk.subarray(start));
+  }
+}
+
+function* fileChunks(file: string, start: number, end: number): Generator<Buffer> {
+  const fd = openSync(file, "r");
+  try {
+    while (start < end) {
+      const chunk = Buffer.allocUnsafe(Math.min(READ_BYTES, end - start));
+      const read = readSync(fd, chunk, 0, chunk.length, start);
+      if (!read) break;
+      yield chunk.subarray(0, read);
+      start += read;
+    }
+  } finally { closeSync(fd); }
 }
 
 const missing = (plain: string) => Object.assign(new Error(`rollout missing: ${basename(plain)}`), { code: "ENOENT" });
@@ -69,24 +148,29 @@ function records(plain: string): Parsed[] {
   if (!file) throw missing(plain);
   const stat = statSync(file);
   let cache = files.get(file);
-  if (file.endsWith(".zst")) {
-    if (!cache || cache.size !== stat.size || cache.mtimeMs !== stat.mtimeMs) {
-      cache = { size: stat.size, mtimeMs: stat.mtimeMs, parsedTo: 0, records: [] };
-      cache.parsedTo = parseLines(zstdDecompressSync(readFileSync(file)), 0, cache);
-      files.set(file, cache);
-    }
-    return cache.records;
+  if (cache) {
+    files.delete(file);
+    cachedBytes -= cache.bytes;
   }
-  if (!cache || stat.size < cache.parsedTo) cache = { size: 0, mtimeMs: 0, parsedTo: 0, records: [] };
+  const compressed = file.endsWith(".zst");
+  const changed = cache && (cache.size !== stat.size || cache.mtimeMs !== stat.mtimeMs);
+  if (!cache || cache.ino !== stat.ino || stat.size < cache.size || (changed && (compressed || cache.size === stat.size))) {
+    cache = { ino: stat.ino, size: -1, mtimeMs: -1, parsedTo: 0, bytes: 0, records: [] };
+  }
   if (stat.size !== cache.size || stat.mtimeMs !== cache.mtimeMs) {
-    const length = stat.size - cache.parsedTo;
-    const buffer = Buffer.alloc(length);
-    const fd = openSync(file, "r");
-    try { readSync(fd, buffer, 0, length, cache.parsedTo); } finally { closeSync(fd); }
-    cache.parsedTo += parseLines(buffer, cache.parsedTo, cache);
+    const chunks = compressed ? [zstdDecompressSync(readFileSync(file))] : fileChunks(file, cache.parsedTo, stat.size);
+    parseChunks(chunks, plain, cache);
     cache.size = stat.size;
     cache.mtimeMs = stat.mtimeMs;
+  }
+  if (cache.bytes <= CACHE_BYTES) {
+    for (const [oldFile, old] of files) {
+      if (files.size < CACHE_FILES && cachedBytes + cache.bytes <= CACHE_BYTES) break;
+      cachedBytes -= old.bytes;
+      files.delete(oldFile);
+    }
     files.set(file, cache);
+    cachedBytes += cache.bytes;
   }
   return cache.records;
 }
@@ -148,7 +232,10 @@ function withSegments<T>(sessionsDir: string, read: (tree: Tree) => T): T {
   }
 }
 
-const baseOf = (file: string): Json | null => (records(file)[0]?.type === "session_meta" ? records(file)[0].payload.history_base ?? null : null);
+const baseOf = (file: string): Json | null => {
+  const first = firstRecord(file);
+  return first?.type === "session_meta" ? first.payload.history_base ?? null : null;
+};
 
 // With `missing` (the second look, after walking the tree again), a page the history starts in that is still not found
 // is left out and its id added to `missing`; without it, the miss is thrown for the caller to look again.
@@ -167,14 +254,37 @@ function effective(segments: Map<string, string>, segmentId: string, endOffset =
   return [...inherited, ...records(file).filter((record) => record.offset < endOffset)];
 }
 
-export function imageData(items: Json[], ref: ImageRef): string | null {
-  const item = items[ref.item];
-  if (ref.part === null) return typeof item?.result === "string" ? item.result : null;
-  const url = (item?.content ?? item?.output)?.[ref.part]?.image_url;
+function imageOwner(item: Json | undefined, part: number | null): Json | undefined {
+  return part === null ? item : (item?.content ?? item?.output)?.[part];
+}
+
+function inlineData(owner: Json | undefined, part: number | null): string | null {
+  if (part === null) return typeof owner?.result === "string" ? owner.result : null;
+  const url = owner?.image_url;
   return typeof url === "string" ? url.slice(url.indexOf(",") + 1) : null;
 }
 
+export function imageData(items: Json[], ref: ImageRef): string | null {
+  const owner = imageOwner(items[ref.item], ref.part);
+  const saved = owner && imageLocations.get(owner);
+  if (!saved) return inlineData(owner, ref.part);
+  const { file, offset, length } = saved.location;
+  const path = existing(file);
+  if (!path) return null;
+  try {
+    const line = path.endsWith(".zst")
+      ? zstdDecompressSync(readFileSync(path)).subarray(offset, offset + length)
+      : Buffer.concat([...fileChunks(path, offset, offset + length)]);
+    const source = imageOwner(JSON.parse(line.toString("utf8")).payload, ref.part);
+    const data = inlineData(source, ref.part);
+    return source && data !== null && imageDigest(source, data, saved.digest.mime).contentId === saved.digest.contentId ? data : null;
+  } catch { return null; }
+}
+
 export function pixelHashOf(items: Json[], ref: ImageRef): string | null {
+  const owner = imageOwner(items[ref.item], ref.part);
+  const saved = owner && imageLocations.get(owner);
+  if (saved) return saved.pixelHash;
   const value = imageData(items, ref);
   return value === null ? null : pixelHashOfData(ref, value);
 }
@@ -189,8 +299,9 @@ export function buildIndex(threadId: string, history: Parsed[]): ThreadIndex {
   let compaction: { before: number; kept: Set<string> } | null = null;
   const interrupted = new Set<number>();
   for (const record of history) {
-    if (record.type === "compacted" && Array.isArray(record.payload.replacement_history)) {
-      compaction = { before: items.length, kept: new Set(findImages(record.payload.replacement_history).map((ref) => ref.key)) };
+    if (record.compactionKeys || (record.type === "compacted" && Array.isArray(record.payload.replacement_history))) {
+      const keys = record.compactionKeys ?? findImages(record.payload.replacement_history).map((ref) => ref.key);
+      compaction = { before: items.length, kept: new Set(keys) };
     }
     if (record.type === "event_msg" && record.payload.type === "task_started" && record.payload.turn_id) {
       current = record.payload.turn_id;

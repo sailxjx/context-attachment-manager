@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { appendFileSync, cpSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -79,6 +80,26 @@ test("ensure starts one engine; a second start on the same port leaves it alone"
   const second = await new Promise<string>((resolve) => execFile(process.execPath, [join(here, "..", "..", "plugin", "src", "proxy.ts"), "--port", String(port), "--stay"], (_error, stdout) => resolve(stdout)));
   assert.match(second, /"alreadyRunning":true/);
   assert.equal((await engineHealth(port))?.pid, first.health!.pid);
+});
+
+test("a listening engine that misses one health deadline is not mistaken for a stopped engine", async (t) => {
+  const data = mkdtempSync(join(tmpdir(), "cam-busy-engine-"));
+  const dir = join(here, "..", "..", "plugin", "src");
+  process.env.CAM_DATA_DIR = data;
+  t.after(() => { delete process.env.CAM_DATA_DIR; });
+  let requests = 0;
+  const server = http.createServer(async (_req, res) => {
+    if (++requests === 1) await sleep(950);
+    res.end(JSON.stringify({ ok: true, service: "codex-attachment-manager", pid: process.pid, build: buildOf(dir) }));
+  });
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const result = await ensureEngine({ port: address.port, dir, waitMs: 3000 });
+  assert.deepEqual([result.state, result.health?.pid], ["running", process.pid]);
+  assert.equal(existsSync(join(data, "proxy")), false, "the health timeout did not spawn another engine");
 });
 
 test("an engine's build follows its code, not its line endings; a missing folder has none", () => {

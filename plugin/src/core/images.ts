@@ -50,6 +50,7 @@ export function imageSize(bytes: Buffer): { width: number; height: number } | nu
 }
 
 const digests = new WeakMap<object, ImageDigest>();
+export const knownImageDigest = (owner: object): ImageDigest | undefined => digests.get(owner);
 
 // Keyed by the object holding the image (a request part, a record's block), so re-reading the same cached records does
 // not hash the same images again. `value` is raw base64, not a data URL.

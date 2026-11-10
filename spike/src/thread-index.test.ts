@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { zstdCompressSync } from "node:zlib";
-import { buildIndex, forkOrigin, hasRollout, loadThreadIndex, readThreadHistory, spawnParent, threadStartedAt, threadsStartedSince } from "../../plugin/src/adapters/codex/thread-index.ts";
+import { buildIndex, forkOrigin, hasRollout, imageData, loadThreadIndex, readThreadHistory, spawnParent, threadStartedAt, threadsStartedSince } from "../../plugin/src/adapters/codex/thread-index.ts";
 import { setPixelCache } from "../../plugin/src/core/pixels.ts";
 import { startThread, todayFolder } from "./testfixtures.ts";
 import { png } from "./testkit.ts";
@@ -57,6 +57,26 @@ test("appending to the rollout adds new ids and keeps the old ones", () => {
   assert.deepEqual(loadThreadIndex(dir, THREAD).images.map((i) => i.name), ["a.png"]);
   appendFileSync(file, upload("msg_2", "t2", "b.png", blue).slice(40));
   assert.deepEqual(loadThreadIndex(dir, THREAD).images.map((i) => [i.id, i.name, i.turn]), [["IMG-001", "a.png", 1], ["IMG-002", "b.png", 2]]);
+});
+
+test("an image spanning read chunks is fetched intact, including after its rollout is compressed", (t) => {
+  const { dir, day } = sessions();
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = join(day, `rollout-2026-09-24T10-00-00-${THREAD}.jsonl`);
+  const bytes = Buffer.concat([red, Buffer.alloc(4 * 1024 * 1024)]);
+  const picture = upload("msg_1", "t1", "a.png", bytes);
+  writeFileSync(file, line("session_meta", { id: THREAD }) + turn("t1") + picture.slice(0, -1));
+  assert.equal(loadThreadIndex(dir, THREAD).images.length, 0);
+  appendFileSync(file, "\n" + line("compacted", { replacement_history: [] }));
+  const first = loadThreadIndex(dir, THREAD);
+  assert.deepEqual(first.images.map((image) => [image.id, image.compacted]), [["IMG-001", true]]);
+  assert.equal(first.items![first.images[0].item].content[1].image_url, undefined);
+  assert.equal(imageData(first.items!, first.images[0]), bytes.toString("base64"));
+  writeFileSync(`${file}.zst`, zstdCompressSync(readFileSync(file)));
+  rmSync(file);
+  const archived = loadThreadIndex(dir, THREAD);
+  assert.deepEqual(archived.images, first.images);
+  assert.equal(imageData(archived.items!, archived.images[0]), bytes.toString("base64"));
 });
 
 test("a later segment inherits its base segment only up to history_base.end_byte_offset", () => {

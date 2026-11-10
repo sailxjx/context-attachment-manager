@@ -326,13 +326,19 @@ function main(): void {
   ensureStableIds(claudeSelectionDirOf());
   const send = (message: Json) => process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
   let engineState = "";
+  let checkingEngine = false;
   const supervise = async () => {
-    if (process.env.CAM_NO_ENGINE === "1") return;
-    const result = await ensureEngine({ port: enginePort, client: HOST });
-    const replaced = result.replaced ? { replacedPid: result.replaced.pid, replacedBuild: result.replaced.build ?? null } : {};
-    if (result.state !== "running" || engineState !== "running") log({ event: "engine", host: HOST, state: result.state, enginePid: result.health?.pid ?? null, build: result.health?.build ?? null, ...replaced });
-    engineState = result.state;
-    engineRunning = result.state !== "failed";
+    if (process.env.CAM_NO_ENGINE === "1" || checkingEngine) return;
+    checkingEngine = true;
+    try {
+      const result = await ensureEngine({ port: enginePort, client: HOST });
+      const replaced = result.replaced ? { replacedPid: result.replaced.pid, replacedBuild: result.replaced.build ?? null } : {};
+      if (result.state !== "running" || engineState !== "running") log({ event: "engine", host: HOST, state: result.state, enginePid: result.health?.pid ?? null, build: result.health?.build ?? null, ...replaced });
+      engineState = result.state;
+      engineRunning = result.state !== "failed";
+    } finally {
+      checkingEngine = false;
+    }
   };
   log({ event: "start", ppid: process.ppid, host: HOST });
   setupState(); // what Codex read when it started this session

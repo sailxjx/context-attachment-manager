@@ -10,6 +10,7 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -107,13 +108,31 @@ export async function retireEngine(port: number, running: Health, by: string | n
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// A cold history scan can delay the HTTP handler. Only a refused TCP connection says no engine is listening.
+function portOccupied(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const done = (occupied: boolean) => { socket.destroy(); resolve(occupied); };
+    socket.once("connect", () => done(true));
+    socket.once("error", (error: NodeJS.ErrnoException) => done(error.code !== "ECONNREFUSED"));
+    socket.setTimeout(250, () => done(true));
+  });
+}
 // The build of each runtime folder, read again once for every different build a running engine reports.
 const knownBuilds = new Map<string, { build: string | null; against: string | null | undefined }>();
 
 export async function ensureEngine(options: { port?: number; waitMs?: number; extraArgs?: string[]; dir?: string; force?: boolean; client?: string } = {}): Promise<{ state: EngineState; health: Health | null; replaced?: Health }> {
   const port = options.port ?? DEFAULT_PORT;
   const dir = options.dir ?? here;
-  const existing = await engineHealth(port, 800, options.client);
+  const waitMs = options.waitMs ?? 8000;
+  const busyUntil = Date.now() + waitMs;
+  let existing = await engineHealth(port, 800, options.client);
+  while (!existing && await portOccupied(port)) {
+    if (Date.now() >= busyUntil) return { state: "failed", health: null };
+    await sleep(150);
+    existing = await engineHealth(port, 800, options.client);
+  }
   let replaced: Health | undefined;
   if (existing) {
     const known = knownBuilds.get(dir);
@@ -126,7 +145,7 @@ export async function ensureEngine(options: { port?: number; waitMs?: number; ex
     replaced = existing;
   }
   spawnEngine(port, options.extraArgs, dir);
-  const deadline = Date.now() + (options.waitMs ?? 8000);
+  const deadline = Date.now() + waitMs;
   while (Date.now() < deadline) {
     await sleep(150);
     const health = await engineHealth(port);
